@@ -21,6 +21,23 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # === Настройка логов ===
 logging.basicConfig(level=logging.INFO)
 
+# добавь в начало:
+POSTED_IDS_FILE = "posted_ids.txt"
+
+# === Функция загрузки истории из файла ===
+def load_posted_ids():
+    if os.path.exists(POSTED_IDS_FILE):
+        with open(POSTED_IDS_FILE, "r") as f:
+            return set(line.strip() for line in f)
+    return set()
+
+# === Функция сохранения новой ссылки ===
+def save_posted_id(post_id: str):
+    with open(POSTED_IDS_FILE, "a") as f:
+        f.write(post_id + "\n")
+
+posted_ids = load_posted_ids()
+
 # === Настройка бота и OpenAI ===
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -35,7 +52,6 @@ reddit = praw.Reddit(
 
 # === Ключевые слова ===
 KEYWORDS = ["merge", "merger", "buyout", "FDA approval", "pdufa", "acquisition", "deal", "phase 3", "nda", "bla", "crl"]
-posted_ids = set()
 
 # === Кнопка подписки ===
 def subscribe_button():
@@ -47,32 +63,27 @@ def subscribe_button():
 async def subscribe_callback(callback: CallbackQuery):
     await callback.message.answer("✅ Вы подписаны на сигналы!")
 
-# === Оценка важности ===
-def importance_level(upvotes: int) -> str:
-    if upvotes >= 1000:
-        return "🔥🔥🔥"
-    elif upvotes >= 500:
-        return "🔥🔥"
-    elif upvotes >= 200:
-        return "🔥"
-    else:
-        return ""
+import re
+
+def markdown_to_html(text: str) -> str:
+    # Преобразуем **жирный** в <b>жирный</b>
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    return text
 
 # === GPT-анализ и перевод новости ===
 async def summarize_post(title: str, selftext: str, url: str, upvotes: int) -> str:
     try:
         description = selftext.strip() or "(описание отсутствует)"
         prompt = (
-            f"Ты — инвестор аналитик.\n"
-            f"Сделай краткий и понятный пост на основе описания. "
-            f"Если описание отсутствует — сделай разумное предположение на основе заголовка.\n"
-            f"Добавь контекст как это может повлиять на цену акций.\n"
-            f"Даже если в новости нет тикеров — предположи, какие компании могут быть затронуты. "
-            f"В конце выведи список связанных тикеров акций или индексов в формате хештегов (#TSLA #AAPL).\n"
-            f"Весь ответ — на русском языке максимум 8-10 строк. Используй немного эмодзи и структурируй ответ.\n\n"
+            f"Ты — инвестор-аналитик.\n"
+            f"Сделай краткий и понятный пост на русском языке на основе описания или заголовка. "
+            f"Переведи заголовок на русский язык, если он на английском. "
+            f"Добавь пояснение, как новость может повлиять на цену акций. "
+            f"Предположи, какие компании могут быть затронуты. "
+            f"В конце выведи хештеги тикеров (#TSLA #AAPL и т.д.). "
+            f"Максимум 8-10 строк, немного эмодзи, структурировано.\n\n"
             f"Заголовок: {title}\n"
             f"Описание: {description}\n"
-            f"Upvotes: {upvotes}\n"
             f"Ссылка: {url}\n\n"
             f"Ответ:"
         )
@@ -85,8 +96,9 @@ async def summarize_post(title: str, selftext: str, url: str, upvotes: int) -> s
         )
 
         summary = response.choices[0].message.content.strip()
-        fire = importance_level(upvotes)
-        return f"{summary}\n\n<b>{fire}</b>\n🔗 {url}"
+        summary = markdown_to_html(summary)  # ⬅️ добавь это
+        return f"{summary}\n\n🔗 {url}"
+
 
     except Exception as e:
         logging.error(f"❌ GPT ошибка: {e}")
@@ -110,12 +122,14 @@ async def fetch_from_reddit():
                     await bot.send_message(
                         chat_id=CHANNEL_ID,
                         text=summary,
-                        reply_markup=subscribe_button(),
+                        #reply_markup=subscribe_button(),
                         disable_web_page_preview=True
                     )
                     logging.info(f"✅ Отправлена Reddit новость: {post.title}")
                     posted_ids.add(post.id)
+                    save_posted_id(post.id)
                     await asyncio.sleep(2)
+
         except Exception as e:
             logging.error(f"❌ Ошибка при обработке Reddit: {e}")
 
@@ -163,14 +177,14 @@ async def fetch_from_rss():
                 if any(kw in title.lower() for kw in KEYWORDS):
                     if link not in posted_ids:
                         summary = await summarize_post(title, entry.get("summary", ""), link, 10)
-                        msg = f"🚀 <b>{title}</b>\n{summary}\n🔗 {link}"
                         await bot.send_message(
                             chat_id=CHANNEL_ID,
-                            text=msg,
-                            reply_markup=subscribe_button(),
+                            text=summary,
+                            #reply_markup=subscribe_button(),
                             disable_web_page_preview=True
                         )
                         posted_ids.add(link)
+                        save_posted_id(link)
                         logging.info(f"✅ Отправлена RSS новость: {title}")
                         await asyncio.sleep(1)
         except Exception as e:
@@ -185,6 +199,86 @@ async def periodic_news_sender():
     while True:
         await fetch_and_send_news()
         await asyncio.sleep(900)  # каждые 15 минут
+from aiogram.types import Message
+
+from sentence_transformers import SentenceTransformer, util
+
+model_embed = SentenceTransformer("all-MiniLM-L6-v2")
+
+def load_chunks_from_txt(file_path: str):
+    with open(file_path, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    chunks = []
+    current_chunk = ""
+    current_header = ""
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith("#"):  # Новый заголовок
+            if current_chunk:
+                chunks.append({"header": current_header, "text": current_chunk.strip()})
+                current_chunk = ""
+            current_header = line
+        else:
+            current_chunk += line + " "
+
+    if current_chunk:
+        chunks.append({"header": current_header, "text": current_chunk.strip()})
+
+    return chunks
+
+chunks = load_chunks_from_txt("aboutchannel.txt")
+
+def search_knowledge_txt(query: str, threshold: float = 0.7) -> str | None:
+    query_embed = model_embed.encode(query, convert_to_tensor=True)
+    best_score = 0.0
+    best_chunk = None
+
+    for chunk in chunks:
+        chunk_embed = model_embed.encode(chunk["text"], convert_to_tensor=True)
+        score = util.cos_sim(query_embed, chunk_embed).item()
+
+        if score > best_score and score >= threshold:
+            best_score = score
+            best_chunk = chunk
+
+    return best_chunk["text"] if best_chunk else None
+
+@dp.message()
+async def handle_user_prompt(message: Message):
+    user_text = message.text.strip()
+    if user_text.startswith("/"):
+        return
+
+    try:
+        kb_answer = search_knowledge_txt(user_text)
+
+        if kb_answer:
+            await message.answer(f"📚 <b>Из базы знаний:</b>\n{kb_answer}")
+        else:
+            prompt = (
+                f"Ты — инвестиционный аналитик и ассистент. Ответь кратко, понятно и по делу на вопрос пользователя:\n"
+                f"Вопрос: {user_text}\n\n"
+                f"Ответ:"
+            )
+
+            response = await openai_client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_tokens=400
+            )
+
+            reply = markdown_to_html(response.choices[0].message.content.strip())
+            await message.answer(reply)
+
+    except Exception as e:
+        logging.error(f"❌ Ошибка: {e}")
+        await message.answer("Произошла ошибка при обработке запроса.")
 
 async def main():
     logging.info("🚀 insidepulseai запущен...")
